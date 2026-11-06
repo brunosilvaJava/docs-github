@@ -1,60 +1,26 @@
 #!/usr/bin/env python3
 """
-Para cada URL da lista: tenta copiar o "Copy markdown" pela área de transferência.
-Se a cópia não for capturada, baixa a versão .md da própria página.
-Salva cada resultado em um arquivo .md.
+Para cada URL do docs.github.com da lista: baixa o corpo do artigo em markdown
+pelo endpoint https://docs.github.com/api/article/body e salva em um arquivo .md.
+
+URLs de outros sites (github.com, developer.hashicorp.com) são puladas.
 
 Uso:
-    pip install playwright
-    python -m playwright install chromium
     python copiar_markdown.py urls.txt --out markdown
-    python copiar_markdown.py urls.txt --out markdown --headed   # mostra o navegador
 """
 
 import argparse
 import re
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.sync_api import sync_playwright
-
-BOTAO = re.compile(r"copy markdown", re.IGNORECASE)
-
-# Roda antes de qualquer script da página. Captura o texto copiado por qualquer um dos
-# caminhos comuns: writeText, clipboard.write, execCommand('copy') ou evento 'copy'.
-CAPTURE_SCRIPT = """
-window.__copiado = null;
-
-const guardar = (texto) => {
-    if (texto && String(texto).trim()) { window.__copiado = String(texto); }
-};
-
-navigator.clipboard.writeText = (texto) => { guardar(texto); return Promise.resolve(); };
-
-navigator.clipboard.write = async (itens) => {
-    for (const item of itens) {
-        if (item.types.includes('text/plain')) {
-            guardar(await (await item.getType('text/plain')).text());
-        }
-    }
-};
-
-document.addEventListener('copy', (e) => {
-    guardar(e.clipboardData ? e.clipboardData.getData('text/plain') : '');
-}, true);
-
-const copiarOriginal = document.execCommand.bind(document);
-document.execCommand = (comando, ...resto) => {
-    if (comando === 'copy') {
-        const ativo = document.activeElement;
-        const usaCampo = ativo && (ativo.tagName === 'TEXTAREA' || ativo.tagName === 'INPUT');
-        guardar(usaCampo ? ativo.value : window.getSelection().toString());
-    }
-    return copiarOriginal(comando, ...resto);
-};
-"""
+ENDPOINT = "https://docs.github.com/api/article/body?pathname="
+HOST_PERMITIDO = "docs.github.com"
 
 
 def ler_urls(caminho):
@@ -93,70 +59,19 @@ def nome_arquivo(url, usados):
     return nome
 
 
-def encontrar_botao(pagina, espera_ms=15000):
-    alvo = pagina.get_by_role("button", name=BOTAO).or_(pagina.get_by_text(BOTAO)).first
-    try:
-        alvo.wait_for(state="visible", timeout=espera_ms)
-        return alvo
-    except Exception:
-        return None
-
-
-def diagnostico(pagina):
-    try:
-        titulo = pagina.title()
-        textos = (
-            pagina.locator("button, a, [role=button]")
-            .filter(has_text=re.compile("copy", re.IGNORECASE))
-            .all_inner_texts()
-        )
-        return f"título={titulo!r}; elementos com 'copy'={textos[:8]}"
-    except Exception as erro:
-        return f"diagnóstico indisponível ({erro})"
-
-
-def copiar_markdown(pagina):
-    botao = encontrar_botao(pagina)
-    if botao is None:
-        raise RuntimeError("botão 'Copy markdown' não apareceu. " + diagnostico(pagina))
-    botao.click(timeout=10000)
-    try:
-        pagina.wait_for_function("window.__copiado !== null", timeout=20000)
-    except Exception:
-        raise RuntimeError(
-            "clique feito, mas o site não enviou texto à área de transferência. "
-            + diagnostico(pagina)
-        )
-    return pagina.evaluate("window.__copiado")
-
-
-def baixar_md(contexto, limpa):
-    resposta = contexto.request.get(limpa + ".md", timeout=30000)
-    if resposta.status != 200:
-        raise RuntimeError(f"{limpa}.md respondeu HTTP {resposta.status}")
-    texto = resposta.text()
-    if texto.lstrip().lower().startswith(("<!doctype", "<html")):
-        raise RuntimeError(f"{limpa}.md devolveu HTML, não markdown")
-    return texto
-
-
-def obter_markdown(contexto, pagina, limpa):
-    """Retorna (texto, origem). Tenta a cópia pelo botão e, se falhar, o .md."""
-    try:
-        return copiar_markdown(pagina), "botão Copy markdown"
-    except Exception as erro_copia:
-        try:
-            return baixar_md(contexto, limpa), "arquivo .md"
-        except Exception as erro_md:
-            raise RuntimeError(f"{erro_copia} | alternativa .md falhou: {erro_md}")
+def baixar_corpo(url):
+    caminho = urlparse(url_limpa(url)).path  # ex.: /en/enterprise-cloud@latest/admin/...
+    alvo = ENDPOINT + urllib.parse.quote(caminho, safe="/@")
+    requisicao = urllib.request.Request(alvo, headers={"User-Agent": "docs-markdown-script/1.0"})
+    with urllib.request.urlopen(requisicao, timeout=60) as resposta:
+        return resposta.read().decode("utf-8")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Salva o 'Copy markdown' de cada página em um .md")
+    ap = argparse.ArgumentParser(description="Salva o markdown de cada página do docs.github.com")
     ap.add_argument("lista", help="arquivo .txt com uma URL por linha")
     ap.add_argument("--out", default="markdown", help="pasta de saída (padrão: markdown)")
-    ap.add_argument("--headed", action="store_true", help="mostra o navegador enquanto roda")
-    ap.add_argument("--pausa", type=float, default=1.0, help="segundos entre páginas (padrão: 1)")
+    ap.add_argument("--pausa", type=float, default=0.5, help="segundos entre páginas (padrão: 0.5)")
     args = ap.parse_args()
 
     urls = ler_urls(args.lista)
@@ -167,43 +82,33 @@ def main():
     salvos = []
     falhas = []
 
-    with sync_playwright() as p:
-        navegador = p.chromium.launch(headless=not args.headed)
-        contexto = navegador.new_context(locale="en-US", viewport={"width": 1280, "height": 900})
-        contexto.add_init_script(CAPTURE_SCRIPT)
-        pagina = contexto.new_page()
+    for i, url in enumerate(urls, 1):
+        limpa = url_limpa(url)
+        print(f"[{i}/{len(urls)}] {limpa}")
 
-        for i, url in enumerate(urls, 1):
-            limpa = url_limpa(url)
-            nome = nome_arquivo(url, usados)
-            origem_permissao = f"{urlparse(limpa).scheme}://{urlparse(limpa).netloc}"
-            print(f"[{i}/{len(urls)}] {limpa}")
-            try:
-                try:
-                    contexto.grant_permissions(
-                        ["clipboard-read", "clipboard-write"], origin=origem_permissao
-                    )
-                except Exception:
-                    pass
-                pagina.goto(limpa, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    pagina.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-                texto, origem = obter_markdown(contexto, pagina, limpa)
-                if not texto or not texto.strip():
-                    raise RuntimeError("o texto veio vazio")
-                conteudo = f"Source: {limpa}\n\n{texto.strip()}\n"
-                (saida / nome).write_text(conteudo, encoding="utf-8")
-                salvos.append(nome)
-                print(f"    salvo ({origem}): {saida / nome}")
-            except Exception as erro:
-                motivo = str(erro).splitlines()[0] if str(erro) else type(erro).__name__
-                falhas.append((limpa, motivo))
-                print(f"    falhou: {motivo}")
-            time.sleep(args.pausa)
+        if urlparse(limpa).netloc != HOST_PERMITIDO:
+            falhas.append((limpa, "não é docs.github.com; copie manualmente"))
+            print("    pulada: não é docs.github.com")
+            continue
 
-        navegador.close()
+        nome = nome_arquivo(url, usados)
+        try:
+            texto = baixar_corpo(limpa)
+            if not texto.strip():
+                raise RuntimeError("o corpo veio vazio")
+            conteudo = f"Source: {limpa}\n\n{texto.strip()}\n"
+            (saida / nome).write_text(conteudo, encoding="utf-8")
+            salvos.append(nome)
+            print(f"    salvo: {saida / nome}")
+        except urllib.error.HTTPError as erro:
+            falhas.append((limpa, f"HTTP {erro.code}"))
+            print(f"    falhou: HTTP {erro.code}")
+        except Exception as erro:
+            motivo = str(erro).splitlines()[0] if str(erro) else type(erro).__name__
+            falhas.append((limpa, motivo))
+            print(f"    falhou: {motivo}")
+
+        time.sleep(args.pausa)
 
     print(f"\nSalvos: {len(salvos)} de {len(urls)}")
     if falhas:
