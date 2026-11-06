@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Para cada URL da lista: abre a página, clica em "Copy markdown",
-captura o texto copiado e salva em um arquivo .md.
+Para cada URL da lista: tenta copiar o "Copy markdown" pela área de transferência.
+Se a cópia não for capturada, baixa a versão .md da própria página.
+Salva cada resultado em um arquivo .md.
 
 Uso:
     pip install playwright
@@ -21,12 +22,14 @@ from playwright.sync_api import sync_playwright
 
 BOTAO = re.compile(r"copy markdown", re.IGNORECASE)
 
-# Roda antes de qualquer script da página. Guarda o texto que o site envia à área de
-# transferência, por qualquer uma das APIs comuns, sem depender de permissão de leitura.
+# Roda antes de qualquer script da página. Captura o texto copiado por qualquer um dos
+# caminhos comuns: writeText, clipboard.write, execCommand('copy') ou evento 'copy'.
 CAPTURE_SCRIPT = """
 window.__copiado = null;
 
-const guardar = (texto) => { window.__copiado = String(texto); };
+const guardar = (texto) => {
+    if (texto && String(texto).trim()) { window.__copiado = String(texto); }
+};
 
 navigator.clipboard.writeText = (texto) => { guardar(texto); return Promise.resolve(); };
 
@@ -37,6 +40,10 @@ navigator.clipboard.write = async (itens) => {
         }
     }
 };
+
+document.addEventListener('copy', (e) => {
+    guardar(e.clipboardData ? e.clipboardData.getData('text/plain') : '');
+}, true);
 
 const copiarOriginal = document.execCommand.bind(document);
 document.execCommand = (comando, ...resto) => {
@@ -114,13 +121,34 @@ def copiar_markdown(pagina):
         raise RuntimeError("botão 'Copy markdown' não apareceu. " + diagnostico(pagina))
     botao.click(timeout=10000)
     try:
-        pagina.wait_for_function("window.__copiado !== null", timeout=5000)
+        pagina.wait_for_function("window.__copiado !== null", timeout=20000)
     except Exception:
         raise RuntimeError(
             "clique feito, mas o site não enviou texto à área de transferência. "
             + diagnostico(pagina)
         )
     return pagina.evaluate("window.__copiado")
+
+
+def baixar_md(contexto, limpa):
+    resposta = contexto.request.get(limpa + ".md", timeout=30000)
+    if resposta.status != 200:
+        raise RuntimeError(f"{limpa}.md respondeu HTTP {resposta.status}")
+    texto = resposta.text()
+    if texto.lstrip().lower().startswith(("<!doctype", "<html")):
+        raise RuntimeError(f"{limpa}.md devolveu HTML, não markdown")
+    return texto
+
+
+def obter_markdown(contexto, pagina, limpa):
+    """Retorna (texto, origem). Tenta a cópia pelo botão e, se falhar, o .md."""
+    try:
+        return copiar_markdown(pagina), "botão Copy markdown"
+    except Exception as erro_copia:
+        try:
+            return baixar_md(contexto, limpa), "arquivo .md"
+        except Exception as erro_md:
+            raise RuntimeError(f"{erro_copia} | alternativa .md falhou: {erro_md}")
 
 
 def main():
@@ -148,11 +176,13 @@ def main():
         for i, url in enumerate(urls, 1):
             limpa = url_limpa(url)
             nome = nome_arquivo(url, usados)
-            origem = f"{urlparse(limpa).scheme}://{urlparse(limpa).netloc}"
+            origem_permissao = f"{urlparse(limpa).scheme}://{urlparse(limpa).netloc}"
             print(f"[{i}/{len(urls)}] {limpa}")
             try:
                 try:
-                    contexto.grant_permissions(["clipboard-read", "clipboard-write"], origin=origem)
+                    contexto.grant_permissions(
+                        ["clipboard-read", "clipboard-write"], origin=origem_permissao
+                    )
                 except Exception:
                     pass
                 pagina.goto(limpa, wait_until="domcontentloaded", timeout=60000)
@@ -160,13 +190,13 @@ def main():
                     pagina.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
-                texto = copiar_markdown(pagina)
+                texto, origem = obter_markdown(contexto, pagina, limpa)
                 if not texto or not texto.strip():
-                    raise RuntimeError("o texto copiado veio vazio")
+                    raise RuntimeError("o texto veio vazio")
                 conteudo = f"Source: {limpa}\n\n{texto.strip()}\n"
                 (saida / nome).write_text(conteudo, encoding="utf-8")
                 salvos.append(nome)
-                print(f"    salvo: {saida / nome}")
+                print(f"    salvo ({origem}): {saida / nome}")
             except Exception as erro:
                 motivo = str(erro).splitlines()[0] if str(erro) else type(erro).__name__
                 falhas.append((limpa, motivo))
