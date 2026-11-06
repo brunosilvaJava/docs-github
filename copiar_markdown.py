@@ -12,21 +12,40 @@ Uso:
 
 import argparse
 import re
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
-BUTTON_TEXT = "Copy markdown"
+BOTAO = re.compile(r"copy markdown", re.IGNORECASE)
 
-# Roda antes de qualquer script da página. Guarda o texto que o site envia
-# ao clipboard, para ler o valor mesmo sem permissão de leitura da área de transferência.
+# Roda antes de qualquer script da página. Guarda o texto que o site envia à área de
+# transferência, por qualquer uma das APIs comuns, sem depender de permissão de leitura.
 CAPTURE_SCRIPT = """
 window.__copiado = null;
-navigator.clipboard.writeText = (texto) => {
-    window.__copiado = String(texto);
-    return Promise.resolve();
+
+const guardar = (texto) => { window.__copiado = String(texto); };
+
+navigator.clipboard.writeText = (texto) => { guardar(texto); return Promise.resolve(); };
+
+navigator.clipboard.write = async (itens) => {
+    for (const item of itens) {
+        if (item.types.includes('text/plain')) {
+            guardar(await (await item.getType('text/plain')).text());
+        }
+    }
+};
+
+const copiarOriginal = document.execCommand.bind(document);
+document.execCommand = (comando, ...resto) => {
+    if (comando === 'copy') {
+        const ativo = document.activeElement;
+        const usaCampo = ativo && (ativo.tagName === 'TEXTAREA' || ativo.tagName === 'INPUT');
+        guardar(usaCampo ? ativo.value : window.getSelection().toString());
+    }
+    return copiarOriginal(comando, ...resto);
 };
 """
 
@@ -67,18 +86,41 @@ def nome_arquivo(url, usados):
     return nome
 
 
+def encontrar_botao(pagina, espera_ms=15000):
+    alvo = pagina.get_by_role("button", name=BOTAO).or_(pagina.get_by_text(BOTAO)).first
+    try:
+        alvo.wait_for(state="visible", timeout=espera_ms)
+        return alvo
+    except Exception:
+        return None
+
+
+def diagnostico(pagina):
+    try:
+        titulo = pagina.title()
+        textos = (
+            pagina.locator("button, a, [role=button]")
+            .filter(has_text=re.compile("copy", re.IGNORECASE))
+            .all_inner_texts()
+        )
+        return f"título={titulo!r}; elementos com 'copy'={textos[:8]}"
+    except Exception as erro:
+        return f"diagnóstico indisponível ({erro})"
+
+
 def copiar_markdown(pagina):
-    botao = pagina.get_by_role("button", name=BUTTON_TEXT).first
-    if botao.count() == 0:
-        botao = pagina.get_by_text(BUTTON_TEXT, exact=True).first
-    botao.wait_for(state="visible", timeout=20000)
-    botao.click()
+    botao = encontrar_botao(pagina)
+    if botao is None:
+        raise RuntimeError("botão 'Copy markdown' não apareceu. " + diagnostico(pagina))
+    botao.click(timeout=10000)
     try:
         pagina.wait_for_function("window.__copiado !== null", timeout=5000)
-        return pagina.evaluate("window.__copiado")
     except Exception:
-        # Se o site não usou writeText, tenta a área de transferência do navegador
-        return pagina.evaluate("navigator.clipboard.readText()")
+        raise RuntimeError(
+            "clique feito, mas o site não enviou texto à área de transferência. "
+            + diagnostico(pagina)
+        )
+    return pagina.evaluate("window.__copiado")
 
 
 def main():
@@ -99,16 +141,25 @@ def main():
 
     with sync_playwright() as p:
         navegador = p.chromium.launch(headless=not args.headed)
-        contexto = navegador.new_context(locale="en-US")
+        contexto = navegador.new_context(locale="en-US", viewport={"width": 1280, "height": 900})
         contexto.add_init_script(CAPTURE_SCRIPT)
         pagina = contexto.new_page()
 
         for i, url in enumerate(urls, 1):
             limpa = url_limpa(url)
             nome = nome_arquivo(url, usados)
+            origem = f"{urlparse(limpa).scheme}://{urlparse(limpa).netloc}"
             print(f"[{i}/{len(urls)}] {limpa}")
             try:
+                try:
+                    contexto.grant_permissions(["clipboard-read", "clipboard-write"], origin=origem)
+                except Exception:
+                    pass
                 pagina.goto(limpa, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    pagina.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
                 texto = copiar_markdown(pagina)
                 if not texto or not texto.strip():
                     raise RuntimeError("o texto copiado veio vazio")
@@ -126,9 +177,12 @@ def main():
 
     print(f"\nSalvos: {len(salvos)} de {len(urls)}")
     if falhas:
-        print("Não salvos (copie esses manualmente):")
+        print("Não salvos:")
         for url, motivo in falhas:
             print(f"  - {url}\n    motivo: {motivo}")
+
+    # Só falha o job se nada foi salvo. Com resultados parciais, o commit ainda acontece.
+    sys.exit(0 if salvos else 1)
 
 
 if __name__ == "__main__":
